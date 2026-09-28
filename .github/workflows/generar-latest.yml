@@ -1,0 +1,91 @@
+name: Preparar avisos de actualizacion
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el instalador de la ultima version estable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/solar-installer"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.exe' -D "$RUNNER_TEMP/solar-installer"
+
+      - name: Generar latest.yml desde los bytes reales del instalador
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import base64
+          import datetime
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import quote
+
+          tag = os.environ['TAG']
+          version = tag.removeprefix('v')
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('Etiqueta invalida: ' + tag)
+
+          directory = Path(os.environ['RUNNER_TEMP']) / 'solar-installer'
+          files = list(directory.glob('*.exe'))
+          if len(files) != 1:
+              raise SystemExit(f'Esperaba un instalador EXE; encontre {len(files)}')
+
+          exe = files[0]
+          digest = hashlib.sha512()
+          with exe.open('rb') as src:
+              for part in iter(lambda: src.read(1024 * 1024), b''):
+                  digest.update(part)
+
+          b64 = base64.b64encode(digest.digest()).decode('ascii')
+          url = (
+              'https://github.com/'
+              + os.environ['GITHUB_REPOSITORY']
+              + '/releases/download/'
+              + quote(tag, safe='')
+              + '/'
+              + quote(exe.name, safe='')
+          )
+          now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+
+          content = (
+              'version: ' + json.dumps(version) + '\n'
+              + 'files:\n'
+              + '  - url: ' + json.dumps(url) + '\n'
+              + '    sha512: ' + b64 + '\n'
+              + '    size: ' + str(exe.stat().st_size) + '\n'
+              + 'path: ' + json.dumps(url) + '\n'
+              + 'sha512: ' + b64 + '\n'
+              + 'releaseDate: ' + json.dumps(now) + '\n'
+          )
+
+          dest = Path(os.environ['RUNNER_TEMP']) / 'latest.yml'
+          dest.write_text(content, encoding='utf-8')
+          print(content)
+          PYCODE
+
+      - name: Incorporar latest.yml al lanzamiento
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" "$RUNNER_TEMP/latest.yml" --clobber -R "$GITHUB_REPOSITORY"
